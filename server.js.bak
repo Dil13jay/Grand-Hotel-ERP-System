@@ -1,0 +1,653 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { URL } = require('url');
+const { DatabaseSync } = require('node:sqlite');
+
+const PORT = process.env.PORT || 3000;
+const ROOT_DIR = __dirname;
+const DB_PATH = path.join(ROOT_DIR, 'grand_hotel.db');
+
+const activeSessions = new Map();
+const SESSION_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+const defaultUsers = [
+  {
+    username: 'admin',
+    password: 'admin123',
+    role: 'Admin',
+    full_name: 'System Administrator'
+  },
+  {
+    username: 'reception',
+    password: 'reception123',
+    role: 'Receptionist',
+    full_name: 'Front Desk Reception'
+  },
+  {
+    username: 'accountant',
+    password: 'accountant123',
+    role: 'Accountant',
+    full_name: 'Accounts Executive'
+  },
+  {
+    username: 'staff',
+    password: 'staff123',
+    role: 'Staff',
+    full_name: 'Housekeeping Staff'
+  }
+];
+
+const initialReservations = [
+  {
+    guest_name: 'Namal Perera',
+    room_number: '103',
+    check_in: '2026-07-15',
+    check_out: '2026-07-18',
+    status: 'Confirmed',
+    amount: 58500,
+    notes: 'Early arrival requested.'
+  },
+  {
+    guest_name: 'Dilani Silva',
+    room_number: '202',
+    check_in: '2026-07-20',
+    check_out: '2026-07-23',
+    status: 'Pending',
+    amount: 109500,
+    notes: 'Needs baby cot.'
+  }
+];
+
+const initialBills = [
+  {
+    reservation_id: 1,
+    guest_name: 'Namal Perera',
+    amount_due: 58500,
+    status: 'Unpaid',
+    notes: 'Includes breakfast package.'
+  },
+  {
+    reservation_id: 2,
+    guest_name: 'Dilani Silva',
+    amount_due: 109500,
+    status: 'Unpaid',
+    notes: 'Advance pending.'
+  }
+];
+
+const initialEmployees = [
+  {
+    name: 'Samitha Fernando',
+    role: 'Housekeeper',
+    department: 'Housekeeping',
+    phone: '+94 77 123 4567',
+    status: 'Active'
+  },
+  {
+    name: 'Amal Jayawardena',
+    role: 'Front Desk Agent',
+    department: 'Reception',
+    phone: '+94 71 987 6543',
+    status: 'Active'
+  }
+];
+
+const initialInventory = [
+  {
+    item_name: 'Bath Towels',
+    quantity: 120,
+    category: 'Linen',
+    status: 'Ready',
+    notes: 'Routine reorder in 2 weeks.'
+  },
+  {
+    item_name: 'Mini Bar Water',
+    quantity: 260,
+    category: 'Beverages',
+    status: 'Low Stock',
+    notes: 'Request extra delivery.'
+  }
+];
+
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password).digest('hex');
+}
+
+function createSession(user) {
+  const token = crypto.randomUUID();
+  const session = {
+    user: {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      full_name: user.full_name
+    },
+    created: Date.now()
+  };
+  activeSessions.set(token, session);
+  return token;
+}
+
+function cleanExpiredSessions() {
+  const now = Date.now();
+  for (const [token, session] of activeSessions.entries()) {
+    if (now - session.created > SESSION_TTL) {
+      activeSessions.delete(token);
+    }
+  }
+}
+
+function getAuthToken(req) {
+  const authHeader = req.headers.authorization || '';
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : null;
+}
+
+function getSession(req) {
+  cleanExpiredSessions();
+  const token = getAuthToken(req);
+  return token ? activeSessions.get(token) : null;
+}
+
+function requireAuth(req) {
+  const session = getSession(req);
+  if (!session) {
+    const error = new Error('Unauthorized');
+    error.status = 401;
+    throw error;
+  }
+  return session.user;
+}
+
+function requireRole(req, allowedRoles) {
+  const user = requireAuth(req);
+  if (!allowedRoles.includes(user.role)) {
+    const error = new Error('Forbidden');
+    error.status = 403;
+    throw error;
+  }
+  return user;
+}
+
+  {
+    id: 1,
+    number: '101',
+    type: 'Standard',
+    floor: '1',
+    capacity: 2,
+    rate: 14500,
+    status: 'Available',
+    condition: 'Excellent',
+    amenities: 'Wi-Fi, Air Conditioning, TV',
+    notes: 'Near the reception area.'
+  },
+  {
+    id: 2,
+    number: '102',
+    type: 'Standard',
+    floor: '1',
+    capacity: 2,
+    rate: 14500,
+    status: 'Occupied',
+    condition: 'Good',
+    amenities: 'Wi-Fi, Air Conditioning, TV',
+    notes: ''
+  },
+  {
+    id: 3,
+    number: '103',
+    type: 'Deluxe',
+    floor: '1',
+    capacity: 2,
+    rate: 19500,
+    status: 'Reserved',
+    condition: 'Excellent',
+    amenities: 'Wi-Fi, Air Conditioning, Smart TV, Mini Bar',
+    notes: 'Late check-in expected.'
+  },
+  {
+    id: 4,
+    number: '201',
+    type: 'Deluxe',
+    floor: '2',
+    capacity: 2,
+    rate: 20500,
+    status: 'Cleaning',
+    condition: 'Good',
+    amenities: 'Wi-Fi, Air Conditioning, Smart TV, Balcony',
+    notes: 'Priority cleaning requested.'
+  },
+  {
+    id: 5,
+    number: '202',
+    type: 'Suite',
+    floor: '2',
+    capacity: 3,
+    rate: 36500,
+    status: 'Available',
+    condition: 'Excellent',
+    amenities: 'Wi-Fi, Air Conditioning, Smart TV, Mini Bar, Jacuzzi',
+    notes: ''
+  },
+  {
+    id: 6,
+    number: '203',
+    type: 'Family',
+    floor: '2',
+    capacity: 4,
+    rate: 31500,
+    status: 'Maintenance',
+    condition: 'Repair Required',
+    amenities: 'Wi-Fi, Air Conditioning, TV, Refrigerator',
+    notes: 'Bathroom tap replacement pending.'
+  },
+  {
+    id: 7,
+    number: '301',
+    type: 'Suite',
+    floor: '3',
+    capacity: 3,
+    rate: 38500,
+    status: 'Occupied',
+    condition: 'Excellent',
+    amenities: 'Wi-Fi, Air Conditioning, Smart TV, Mini Bar, Balcony',
+    notes: ''
+  },
+  {
+    id: 8,
+    number: '302',
+    type: 'Deluxe',
+    floor: '3',
+    capacity: 2,
+    rate: 22500,
+    status: 'Available',
+    condition: 'Good',
+    amenities: 'Wi-Fi, Air Conditioning, Smart TV',
+    notes: ''
+  },
+  {
+    id: 9,
+    number: '303',
+    type: 'Family',
+    floor: '3',
+    capacity: 5,
+    rate: 33500,
+    status: 'Reserved',
+    condition: 'Excellent',
+    amenities: 'Wi-Fi, Air Conditioning, Two TVs, Refrigerator',
+    notes: 'Baby cot requested.'
+  },
+  {
+    id: 10,
+    number: '401',
+    type: 'Suite',
+    floor: '4',
+    capacity: 2,
+    rate: 42500,
+    status: 'Cleaning',
+    condition: 'Needs Inspection',
+    amenities: 'Wi-Fi, Air Conditioning, Smart TV, Mini Bar, Jacuzzi',
+    notes: 'Supervisor inspection after cleaning.'
+  },
+  {
+    id: 11,
+    number: '402',
+    type: 'Deluxe',
+    floor: '4',
+    capacity: 2,
+    rate: 24500,
+    status: 'Available',
+    condition: 'Excellent',
+    amenities: 'Wi-Fi, Air Conditioning, Smart TV, Balcony',
+    notes: ''
+  },
+  {
+    id: 12,
+    number: '403',
+    type: 'Family',
+    floor: '4',
+    capacity: 4,
+    rate: 34500,
+    status: 'Occupied',
+    condition: 'Good',
+    amenities: 'Wi-Fi, Air Conditioning, TV, Refrigerator',
+    notes: ''
+  }
+];
+
+const db = new DatabaseSync(DB_PATH);
+
+function initDb() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS rooms (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_number TEXT NOT NULL UNIQUE,
+      room_type TEXT NOT NULL,
+      floor TEXT NOT NULL,
+      capacity INTEGER NOT NULL DEFAULT 2,
+      rate_per_night REAL NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'Available',
+      condition TEXT NOT NULL DEFAULT 'Excellent',
+      amenities TEXT,
+      notes TEXT
+    );
+  `);
+
+  const count = db.prepare('SELECT COUNT(*) AS count FROM rooms').get().count;
+  if (count === 0) {
+    const insertStmt = db.prepare(`
+      INSERT INTO rooms (room_number, room_type, floor, capacity, rate_per_night, status, condition, amenities, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    initialRooms.forEach((room) => {
+      insertStmt.run(
+        room.number,
+        room.type,
+        room.floor,
+        room.capacity,
+        room.rate,
+        room.status,
+        room.condition,
+        room.amenities,
+        room.notes
+      );
+    });
+  }
+}
+
+function mapRoom(row) {
+  return {
+    id: row.id,
+    number: row.room_number,
+    type: row.room_type,
+    floor: row.floor,
+    capacity: row.capacity,
+    rate: Number(row.rate_per_night),
+    status: row.status,
+    condition: row.condition,
+    amenities: row.amenities,
+    notes: row.notes
+  };
+}
+
+function getRooms() {
+  const rows = db
+    .prepare(`
+      SELECT id, room_number, room_type, floor, capacity, rate_per_night, status, condition, amenities, notes
+      FROM rooms
+      ORDER BY CAST(room_number AS INTEGER), room_number
+    `)
+    .all();
+  return rows.map(mapRoom);
+}
+
+function roomNumberExists(number, excludeId = null) {
+  const row = db
+    .prepare('SELECT id FROM rooms WHERE lower(room_number) = lower(?) AND id != ?')
+    .get(number, excludeId ?? -1);
+  return Boolean(row);
+}
+
+function addRoom(payload) {
+  const roomNumber = String(payload.number || '').trim();
+  if (!roomNumber) {
+    throw new Error('Room number is required');
+  }
+  if (roomNumberExists(roomNumber)) {
+    throw new Error('Room number already exists');
+  }
+
+  const insertStmt = db.prepare(`
+    INSERT INTO rooms (room_number, room_type, floor, capacity, rate_per_night, status, condition, amenities, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const result = insertStmt.run(
+    roomNumber,
+    payload.type || 'Standard',
+    payload.floor || '1',
+    Number(payload.capacity || 2),
+    Number(payload.rate || 0),
+    payload.status || 'Available',
+    payload.condition || 'Excellent',
+    payload.amenities || 'Standard amenities',
+    payload.notes || ''
+  );
+
+  return mapRoom(db.prepare('SELECT id, room_number, room_type, floor, capacity, rate_per_night, status, condition, amenities, notes FROM rooms WHERE id = ?').get(result.lastInsertRowid));
+}
+
+function updateRoom(roomId, payload) {
+  const roomNumber = String(payload.number || '').trim();
+  if (!roomNumber) {
+    throw new Error('Room number is required');
+  }
+  if (roomNumberExists(roomNumber, roomId)) {
+    throw new Error('Room number already exists');
+  }
+
+  db.prepare(`
+    UPDATE rooms
+    SET room_number = ?, room_type = ?, floor = ?, capacity = ?, rate_per_night = ?, status = ?, condition = ?, amenities = ?, notes = ?
+    WHERE id = ?
+  `).run(
+    roomNumber,
+    payload.type || 'Standard',
+    payload.floor || '1',
+    Number(payload.capacity || 2),
+    Number(payload.rate || 0),
+    payload.status || 'Available',
+    payload.condition || 'Excellent',
+    payload.amenities || 'Standard amenities',
+    payload.notes || '',
+    roomId
+  );
+
+  return getRoomById(roomId);
+}
+
+function getRoomById(roomId) {
+  const row = db.prepare('SELECT id, room_number, room_type, floor, capacity, rate_per_night, status, condition, amenities, notes FROM rooms WHERE id = ?').get(roomId);
+  return row ? mapRoom(row) : null;
+}
+
+function updateRoomStatus(roomId, status) {
+  const room = getRoomById(roomId);
+  if (!room) {
+    throw new Error('Room not found');
+  }
+
+  let condition = room.condition;
+  if (status === 'Maintenance') {
+    condition = 'Repair Required';
+  } else if (status === 'Available' && room.condition === 'Repair Required') {
+    condition = 'Good';
+  }
+
+  db.prepare('UPDATE rooms SET status = ?, condition = ? WHERE id = ?').run(status, condition, roomId);
+  return getRoomById(roomId);
+}
+
+function resetRooms() {
+  db.prepare('DELETE FROM rooms').run();
+  const insertStmt = db.prepare(`
+    INSERT INTO rooms (room_number, room_type, floor, capacity, rate_per_night, status, condition, amenities, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  initialRooms.forEach((room) => {
+    insertStmt.run(
+      room.number,
+      room.type,
+      room.floor,
+      room.capacity,
+      room.rate,
+      room.status,
+      room.condition,
+      room.amenities,
+      room.notes
+    );
+  });
+}
+
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function getContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.html':
+      return 'text/html; charset=utf-8';
+    case '.css':
+      return 'text/css; charset=utf-8';
+    case '.js':
+      return 'application/javascript; charset=utf-8';
+    case '.json':
+      return 'application/json; charset=utf-8';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.png':
+      return 'image/png';
+    case '.svg':
+      return 'image/svg+xml';
+    case '.ico':
+      return 'image/x-icon';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+function serveStatic(req, res) {
+  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = decodeURIComponent(requestUrl.pathname);
+
+  if (pathname.startsWith('/api/')) {
+    return false;
+  }
+
+  let filePath = pathname === '/' ? path.join(ROOT_DIR, 'index.html') : path.join(ROOT_DIR, pathname);
+
+  if (!filePath.startsWith(ROOT_DIR)) {
+    sendJson(res, 403, { error: 'Forbidden' });
+    return true;
+  }
+
+  if (!fs.existsSync(filePath)) {
+    filePath = path.join(ROOT_DIR, 'index.html');
+  }
+
+  const stats = fs.statSync(filePath);
+  if (stats.isDirectory()) {
+    filePath = path.join(filePath, 'index.html');
+  }
+
+  res.writeHead(200, { 'Content-Type': getContentType(filePath) });
+  fs.createReadStream(filePath).pipe(res);
+  return true;
+}
+
+function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+initDb();
+
+const server = http.createServer(async (req, res) => {
+  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = decodeURIComponent(requestUrl.pathname);
+
+  if (serveStatic(req, res)) {
+    return;
+  }
+
+  try {
+    if (pathname === '/api/health') {
+      sendJson(res, 200, { status: 'ok' });
+      return;
+    }
+
+    if (pathname === '/api/rooms' && req.method === 'GET') {
+      sendJson(res, 200, getRooms());
+      return;
+    }
+
+    if (pathname === '/api/rooms' && req.method === 'POST') {
+      const payload = await parseJsonBody(req);
+      const newRoom = addRoom(payload);
+      sendJson(res, 201, newRoom);
+      return;
+    }
+
+    if (pathname === '/api/rooms/reset' && req.method === 'POST') {
+      resetRooms();
+      sendJson(res, 200, { message: 'Demo data restored' });
+      return;
+    }
+
+    const roomMatch = pathname.match(/^\/api\/rooms\/(\d+)$/);
+    if (roomMatch && req.method === 'PUT') {
+      const roomId = Number(roomMatch[1]);
+      const payload = await parseJsonBody(req);
+      const updatedRoom = updateRoom(roomId, payload);
+      sendJson(res, 200, updatedRoom);
+      return;
+    }
+
+    if (roomMatch && req.method === 'PATCH') {
+      const roomId = Number(roomMatch[1]);
+      const payload = await parseJsonBody(req);
+      const updatedRoom = updateRoomStatus(roomId, payload.status);
+      sendJson(res, 200, updatedRoom);
+      return;
+    }
+
+    if (roomMatch && req.method === 'DELETE') {
+      const roomId = Number(roomMatch[1]);
+      const existing = getRoomById(roomId);
+      if (!existing) {
+        sendJson(res, 404, { error: 'Room not found' });
+        return;
+      }
+
+      db.prepare('DELETE FROM rooms WHERE id = ?').run(roomId);
+      sendJson(res, 200, { message: 'Room deleted' });
+      return;
+    }
+
+    sendJson(res, 404, { error: 'Not found' });
+  } catch (error) {
+    sendJson(res, 400, { error: error.message });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Grand Hotel room management backend is running on http://localhost:${PORT}`);
+  console.log(`SQLite database: ${DB_PATH}`);
+});
