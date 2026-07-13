@@ -9,10 +9,11 @@ const PORT = process.env.PORT || 3000;
 const ROOT_DIR = __dirname;
 
 const dbConfig = {
-  host: 'localhost',
-  user: 'root',
-  password: '',
-  database: 'grand_hotel_db'
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'grand_hotel_db',
+  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined
 };
 
 let pool;
