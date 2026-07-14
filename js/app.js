@@ -367,13 +367,263 @@ async function loadReservations() {
   }
 }
 
-// ========== BILLING MODULE (Placeholder) ==========
+// ========== BILLING MODULE ==========
+let billListCache = [];
+
 async function loadBills() {
   try {
     const bills = await apiCall('GET', '/bills');
+    billListCache = bills;
+    renderBillTable(getFilteredBills());
     document.getElementById('billCount').textContent = `${bills.length} bill${bills.length !== 1 ? 's' : ''}`;
+    document.getElementById('billUpdated').innerHTML = '<i class="bi bi-clock-history"></i> Just now';
+    setupBillSearchAndFilter();
   } catch (error) {
     document.getElementById('billTableBody').innerHTML = '<tr><td colspan="7" class="text-center text-muted p-4">Failed to load bills</td></tr>';
+  }
+}
+
+function getFilteredBills() {
+  const searchInput = document.getElementById('billSearch');
+  const filterSelect = document.getElementById('billStatusFilter');
+  const query = (searchInput?.value || '').toLowerCase();
+  const status = filterSelect?.value || '';
+
+  return billListCache.filter((bill) => {
+    const matchesSearch = !query || [bill.guest_name, bill.notes, String(bill.reservation_id)].some((value) => (value || '').toLowerCase().includes(query));
+    const matchesStatus = !status || bill.status === status;
+    return matchesSearch && matchesStatus;
+  });
+}
+
+function renderBillTable(bills) {
+  const tbody = document.getElementById('billTableBody');
+  if (!tbody) return;
+
+  if (bills.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted p-4">No bills found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = bills.map((bill, index) => `
+    <tr>
+      <td><small class="text-muted">#${bill.id}</small></td>
+      <td><strong>${bill.guest_name}</strong></td>
+      <td>#${bill.reservation_id}</td>
+      <td>${Number(bill.amount_due).toLocaleString('en-LK', { maximumFractionDigits: 2 })}</td>
+      <td>
+        <span class="badge ${bill.status === 'Paid' ? 'bg-success' : 'bg-warning text-dark'}">
+          ${bill.status}
+        </span>
+      </td>
+      <td>${bill.notes || '—'}</td>
+      <td class="text-end">
+        ${bill.status !== 'Paid' ? `<button class="btn btn-sm btn-outline-success me-2" onclick="payBill(${bill.id})"><i class="bi bi-cash-stack"></i></button>` : ''}
+        <button class="btn btn-sm btn-outline-primary me-2" onclick="editBill(${bill.id})"><i class="bi bi-pencil"></i></button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function setupBillSearchAndFilter() {
+  const searchInput = document.getElementById('billSearch');
+  const filterSelect = document.getElementById('billStatusFilter');
+
+  if (searchInput) {
+    searchInput.oninput = () => renderBillTable(getFilteredBills());
+  }
+
+  if (filterSelect) {
+    filterSelect.onchange = () => renderBillTable(getFilteredBills());
+  }
+}
+
+function showAddBillModal() {
+  currentEntityType = 'bill';
+  currentEntity = null;
+
+  const modalLabel = document.getElementById('entityModalLabel');
+  const modalBody = document.getElementById('entityModalBody');
+
+  modalLabel.textContent = 'Create New Bill';
+  modalBody.innerHTML = `
+    <div class="row g-3">
+      <div class="col-12">
+        <label class="form-label">Reservation</label>
+        <select class="form-select" id="billReservationId" required></select>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Guest Name</label>
+        <input type="text" class="form-control" id="billGuestName" required />
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Amount Due</label>
+        <input type="number" min="0" step="0.01" class="form-control" id="billAmountDue" required />
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Status</label>
+        <select class="form-select" id="billStatus">
+          <option value="Unpaid">Unpaid</option>
+          <option value="Paid">Paid</option>
+        </select>
+      </div>
+      <div class="col-12">
+        <label class="form-label">Notes</label>
+        <textarea class="form-control" id="billNotes" rows="3"></textarea>
+      </div>
+    </div>
+  `;
+
+  populateBillReservationOptions();
+  const modal = new (window.bootstrap || {}).Modal(document.getElementById('entityModal'));
+  modal.show();
+}
+
+async function populateBillReservationOptions(selectedId = null) {
+  try {
+    const reservations = await apiCall('GET', '/reservations');
+    const select = document.getElementById('billReservationId');
+    if (!select) return;
+
+    select.innerHTML = ['<option value="">Select reservation</option>', ...reservations.map((reservation) => `
+      <option value="${reservation.id}" ${selectedId && String(selectedId) === String(reservation.id) ? 'selected' : ''}>
+        #${reservation.id} - ${reservation.guest_name} (${reservation.room_number})
+      </option>
+    `)].join('');
+
+    select.addEventListener('change', (event) => {
+      const selectedReservation = reservations.find((reservation) => String(reservation.id) === String(event.target.value));
+      const guestInput = document.getElementById('billGuestName');
+      if (selectedReservation && guestInput) {
+        guestInput.value = selectedReservation.guest_name;
+      }
+    });
+
+    if (selectedId) {
+      select.value = String(selectedId);
+      const selectedReservation = reservations.find((reservation) => String(reservation.id) === String(selectedId));
+      const guestInput = document.getElementById('billGuestName');
+      if (selectedReservation && guestInput) {
+        guestInput.value = selectedReservation.guest_name;
+      }
+    }
+  } catch (error) {
+    showToast('Failed to load reservations for billing', 'danger');
+  }
+}
+
+async function editBill(billId) {
+  try {
+    const [bills, reservations] = await Promise.all([
+      apiCall('GET', '/bills'),
+      apiCall('GET', '/reservations')
+    ]);
+
+    const bill = bills.find((item) => item.id === billId);
+    if (!bill) throw new Error('Bill not found');
+
+    currentEntityType = 'bill';
+    currentEntity = bill;
+
+    const modalLabel = document.getElementById('entityModalLabel');
+    const modalBody = document.getElementById('entityModalBody');
+
+    modalLabel.textContent = `Edit Bill #${bill.id}`;
+    modalBody.innerHTML = `
+      <div class="row g-3">
+        <div class="col-12">
+          <label class="form-label">Reservation</label>
+          <select class="form-select" id="billReservationId" required></select>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Guest Name</label>
+          <input type="text" class="form-control" id="billGuestName" value="${bill.guest_name}" required />
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Amount Due</label>
+          <input type="number" min="0" step="0.01" class="form-control" id="billAmountDue" value="${bill.amount_due}" required />
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Status</label>
+          <select class="form-select" id="billStatus">
+            <option value="Unpaid" ${bill.status === 'Unpaid' ? 'selected' : ''}>Unpaid</option>
+            <option value="Paid" ${bill.status === 'Paid' ? 'selected' : ''}>Paid</option>
+          </select>
+        </div>
+        <div class="col-12">
+          <label class="form-label">Notes</label>
+          <textarea class="form-control" id="billNotes" rows="3">${bill.notes || ''}</textarea>
+        </div>
+      </div>
+    `;
+
+    const select = document.getElementById('billReservationId');
+    select.innerHTML = ['<option value="">Select reservation</option>', ...reservations.map((reservation) => `
+      <option value="${reservation.id}" ${String(reservation.id) === String(bill.reservation_id) ? 'selected' : ''}>
+        #${reservation.id} - ${reservation.guest_name} (${reservation.room_number})
+      </option>
+    `)].join('');
+
+    select.addEventListener('change', (event) => {
+      const selectedReservation = reservations.find((reservation) => String(reservation.id) === String(event.target.value));
+      const guestInput = document.getElementById('billGuestName');
+      if (selectedReservation && guestInput) {
+        guestInput.value = selectedReservation.guest_name;
+      }
+    });
+
+    const modal = new (window.bootstrap || {}).Modal(document.getElementById('entityModal'));
+    modal.show();
+  } catch (error) {
+    showToast('Failed to load bill', 'danger');
+  }
+}
+
+async function saveBill() {
+  const reservationId = document.getElementById('billReservationId').value;
+  const guestName = document.getElementById('billGuestName').value.trim();
+  const amountDue = document.getElementById('billAmountDue').value.trim();
+  const status = document.getElementById('billStatus').value;
+  const notes = document.getElementById('billNotes').value.trim();
+
+  if (!reservationId || !guestName || !amountDue) {
+    showToast('Please complete the reservation, guest name, and amount fields', 'warning');
+    return;
+  }
+
+  try {
+    const payload = {
+      reservation_id: Number(reservationId),
+      guest_name: guestName,
+      amount_due: Number(amountDue),
+      status,
+      notes
+    };
+
+    if (currentEntity) {
+      await apiCall('PUT', `/bills/${currentEntity.id}`, payload);
+      showToast('Bill updated successfully', 'success');
+    } else {
+      await apiCall('POST', '/bills', payload);
+      showToast('Bill created successfully', 'success');
+    }
+
+    (window.bootstrap || {}).Modal.getInstance(document.getElementById('entityModal')).hide();
+    loadBills();
+  } catch (error) {
+    showToast('Failed to save bill', 'danger');
+  }
+}
+
+async function payBill(billId) {
+  if (!confirm('Mark this bill as paid?')) return;
+
+  try {
+    await apiCall('PATCH', `/bills/${billId}/pay`);
+    showToast('Payment recorded successfully', 'success');
+    loadBills();
+  } catch (error) {
+    showToast('Failed to record payment', 'danger');
   }
 }
 
@@ -472,11 +722,16 @@ document.addEventListener('DOMContentLoaded', () => {
     switchPage(page);
   });
   
+  // Billing modal
+  document.getElementById('addBillBtn').addEventListener('click', showAddBillModal);
+
   // Employee modal
   document.getElementById('addEmployeeBtn').addEventListener('click', showAddEmployeeModal);
   document.getElementById('entityForm').addEventListener('submit', (e) => {
     e.preventDefault();
-    if (currentEntityType === 'employee') {
+    if (currentEntityType === 'bill') {
+      saveBill();
+    } else if (currentEntityType === 'employee') {
       saveEmployee();
     }
   });
